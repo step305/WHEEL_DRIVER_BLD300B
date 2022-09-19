@@ -1,0 +1,11 @@
+            | left  |               USB                         | right |
+STOP LED    |   1   |   PA9     |                   |   GND     |   1   |   GND             |
+REVERSE LED |   2   |   PA10    |                   |   GND     |   2   |   GND             |
+LEFT LED    |   3   |   PA12    |                   |   PA5     |   3   |   WHEEL2 CONTR    |
+RIGHT LED   |   4   |   PB0     |                   |   PA4     |   4   |   WHEEL1 CONTR    |
+WHEEL2 EN   |   5   |   PB7     |                   |   PA1     |   5   |   WHEEL2 SPEED    |
+WHEEL2 F/R  |   6   |   PA15    |                   |   PA0     |   6   |   WHEEL1 SPEED    |
+WHEEL2 BREAK|   7   |   PB6     |
+WHEEL1 BREAK|   8   |   PA11    |
+WHEEL1 F/R  |   9   |   PB5     |
+WHEEL1 EN   |   10  |   PB4     |

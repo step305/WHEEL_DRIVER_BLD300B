@@ -29,50 +29,18 @@
 #include "string.h"
 #include "stdio.h"
 #include "math.h"
+#include "uart_parser.h"
+#include "odometry.h"
+#include "control_wheel.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-#define MOVING_AVERAGE_FILTER_LEN 2
-typedef struct {
-    float data[MOVING_AVERAGE_FILTER_LEN];
-    float new_inp;
-    float out;
-    float filter_state[2];
-    uint32_t index;
-} MOVING_AVERAGE_FILTER_STATE;
-
-#define RX_BUFFER_LEN	255
-typedef enum ParserStates {WAIT_START_PACKET, WAIT_END_PACKET} ParserStatesValues;
-#pragma pack(1)
-typedef struct {
-    ParserStatesValues state;
-    char buffer[RX_BUFFER_LEN];
-    uint16_t data_cnt;
-    float speed1;
-    float speed2;
-    uint8_t is_request;
-} ParserStateType;
-#pragma pack()
-
-#pragma pack(1)
-typedef struct {
-    float speed1;
-    float speed2;
-    uint8_t is_request;
-} CommandType;
-#pragma pack()
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define Tx_BUFFER_LEN  256
-#define DMA_TIMER_CHANNEL_HALF_LEN	2
-#define DMA_TIMER_CHANNEL_LEN	(2*DMA_TIMER_CHANNEL_HALF_LEN)
-#define TIMEOUT_MS	70
-#define WHEEL_POLES 13.0f
-#define UNIT_TORQUE 80.0f
-#define MIN_SPEED 80.0f
 #define NumCommands	6
 
 /* USER CODE END PD */
@@ -85,38 +53,9 @@ typedef struct {
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-float B[3] = {0.067455273889072f, 0.134910547778144f, 0.067455273889072f};
-float A[2] = {-1.142980502539901f, 0.412801598096189f};
 
 uint8_t tx_buffer_ready = 1;
 uint8_t tx_buffer[Tx_BUFFER_LEN] = {0,};
-
-uint8_t rx_buffer_ready = 1;
-uint8_t rx_buffer = 0;
-ParserStateType rx_state;
-CommandType rx_command;
-
-__IO uint32_t dma_buffer_timer_channel_1[DMA_TIMER_CHANNEL_LEN] = {0,};
-__IO uint32_t dma_buffer_timer_channel_2[DMA_TIMER_CHANNEL_LEN] = {0,};
-
-__IO uint32_t dma_buffer_timer_channel_1_safe[DMA_TIMER_CHANNEL_HALF_LEN + 1] = {0,};
-__IO uint32_t dma_buffer_timer_channel_2_safe[DMA_TIMER_CHANNEL_HALF_LEN + 1] = {0,};
-
-__IO uint8_t dma_timer_channel_1_ready = 0;
-__IO uint8_t dma_timer_channel_2_ready = 0;
-
-uint32_t timestamp_channel_1 = 0;
-uint32_t timestamp_channel_2 = 0;
-
-uint32_t timestamp = 0;
-
-MOVING_AVERAGE_FILTER_STATE filter_1_state;
-MOVING_AVERAGE_FILTER_STATE filter_2_state;
-
-uint32_t torque1_value = 0;
-uint32_t torque2_value = 0;
-
-
 
 __IO uint8_t timer100Hz_elapsed = 0;
 /* USER CODE END PV */
@@ -148,142 +87,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     }
 }
 
-void HAL_TIM_IC_CaptureHalfCpltCallback(TIM_HandleTypeDef *htim) {
-    switch (htim->Channel) {
-        case HAL_TIM_ACTIVE_CHANNEL_1:
-            memcpy(&dma_buffer_timer_channel_1_safe[1], dma_buffer_timer_channel_1, DMA_TIMER_CHANNEL_HALF_LEN*4);
-            dma_timer_channel_1_ready = 1;
-            break;
-        case HAL_TIM_ACTIVE_CHANNEL_2:
-            memcpy(&dma_buffer_timer_channel_2_safe[1], dma_buffer_timer_channel_2, DMA_TIMER_CHANNEL_HALF_LEN*4);
-            dma_timer_channel_2_ready = 1;
-            break;
-        default:
-            break;
-    }
-}
-
-void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
-    switch (htim->Channel) {
-        case HAL_TIM_ACTIVE_CHANNEL_1:
-            memcpy(&dma_buffer_timer_channel_1_safe[1], &dma_buffer_timer_channel_1[DMA_TIMER_CHANNEL_HALF_LEN], DMA_TIMER_CHANNEL_HALF_LEN*4);
-            dma_timer_channel_1_ready = 1;
-            break;
-        case HAL_TIM_ACTIVE_CHANNEL_2:
-            memcpy(&dma_buffer_timer_channel_2_safe[1], &dma_buffer_timer_channel_2[DMA_TIMER_CHANNEL_HALF_LEN], DMA_TIMER_CHANNEL_HALF_LEN*4);
-            dma_timer_channel_2_ready = 1;
-            break;
-        default:
-            break;
-    }
-}
-
-float calc_mean_diff(__IO uint32_t array[], uint32_t len) {
-    uint32_t sum_delta = 0;
-    for (uint32_t i = 1; i < len; i++) {
-        sum_delta += (uint32_t)(array[i] - array[i - 1]);
-    }
-    return ((float)sum_delta) / (float)(len - 1);
-}
-
-float calc_mean(float array[], uint32_t len) {
-    float sum = 0.0f;
-    for (uint32_t i = 0; i < len; i++) {
-        sum += array[i];
-    }
-    return sum / (float)len;
-}
-
-void iterate_moving_average_filter(MOVING_AVERAGE_FILTER_STATE *state) {
-    state->data[state->index] = state->new_inp;
-    state->index++;
-    if (state->index == MOVING_AVERAGE_FILTER_LEN) {
-        state->index = 0;
-    }
-    state->out = 170000000.0f / calc_mean(state->data, MOVING_AVERAGE_FILTER_LEN) * 60.0f / WHEEL_POLES / 60.0f * 360.0f / 3.0f/1.1125f;
-}
-
-float filter_butter(float x, float Z[]){
-    float y;
-    y = Z[0] + x * B[0];
-    Z[0] = (Z[1] + x * B[1]) + -y * A[0];
-    Z[1] = x * B[2] + -y * A[1];
-    y = 170000000.0f / y * 10.0f;
-    return y;
-}
-
-void control_wheels(uint32_t torq1, uint32_t torq2) {
-    HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_1, DAC_ALIGN_12B_R, torq1);
-    HAL_DAC_SetValue(&hdac1, DAC_CHANNEL_2, DAC_ALIGN_12B_R, torq2);
-    HAL_DACEx_DualStart(&hdac1);
-}
-
-void set_torque(uint32_t *torq, float speed) {
-    speed = speed / UNIT_TORQUE;
-    if (speed > 1.0f) {
-        *torq = (uint32_t)(250.0f * speed);
-        return;
-    } else {
-        *torq = 0;
-    }
-}
-
-int8_t parse_next_byte(char byte, ParserStateType* state) {
-    int8_t result = -1;
-    float speed1 = 0.0f;
-    float speed2 = 0.0f;
-    char request = 0;
-
-    switch((state->state)) {
-        case(WAIT_START_PACKET):
-            if(byte == '$') {
-                memset(state->buffer, 0, 255);
-                state->data_cnt = 0;
-                state->buffer[state->data_cnt] = byte;
-                state->data_cnt++;
-                state->state = WAIT_END_PACKET;
-            }
-            break;
-        case(WAIT_END_PACKET):
-            if (state->data_cnt < RX_BUFFER_LEN) {
-                if(byte=='\n') {
-                    if (state->data_cnt > 0) {
-                        if (sscanf(&state->buffer[0], "$%c W1:%f W2:%f", &request, &speed1, &speed2) == 3) {
-                            if (request == '?') {
-                                state->is_request = 1;
-                            } else {
-                                state->is_request = 0;
-                            }
-                            state->speed1 = speed1;
-                            state->speed2 = speed2;
-                            result = 1;
-                        }
-                    }
-                    state->state = WAIT_START_PACKET;
-                } else {
-                    state->buffer[state->data_cnt] = byte;
-                    state->data_cnt++;
-                    state->state = WAIT_END_PACKET;
-                }
-            } else {
-                state->state = WAIT_START_PACKET;
-            }
-            break;
-        default:
-            state->state = WAIT_START_PACKET;
-            break;
-    }
-    return result;
-}
-
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     if (huart == &huart2) {
-        if (parse_next_byte(rx_buffer, &rx_state) > 0) {
-            rx_command.speed1 = rx_state.speed1;
-            rx_command.speed2 = rx_state.speed2;
-            rx_command.is_request = rx_state.is_request;
-            rx_buffer_ready = 1;
-        }
+        process_rx_byte(rx_buffer);
         HAL_UART_Receive_IT(&huart2, &rx_buffer, 1);
     }
 }
@@ -296,10 +102,6 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 int main(void)
 {
   /* USER CODE BEGIN 1 */
-  float torq1 = 0.0f;
-  uint32_t loop_cnt = 0;
-  float target_speed1 = 0.0f;
-  float target_speed2 = 0.0f;
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -326,15 +128,12 @@ int main(void)
   MX_USART2_UART_Init();
   MX_TIM7_Init();
   /* USER CODE BEGIN 2 */
-    HAL_TIM_IC_Start_DMA(&htim2, TIM_CHANNEL_1, dma_buffer_timer_channel_1, DMA_TIMER_CHANNEL_LEN);
-    HAL_TIM_IC_Start_DMA(&htim2, TIM_CHANNEL_2, dma_buffer_timer_channel_2, DMA_TIMER_CHANNEL_LEN);
+    HAL_TIM_IC_Start_DMA(&htim2, TIM_CHANNEL_1, (uint32_t *)dma_buffer_timer_channel_1, DMA_TIMER_CHANNEL_LEN);
+    HAL_TIM_IC_Start_DMA(&htim2, TIM_CHANNEL_2, (uint32_t *)dma_buffer_timer_channel_2, DMA_TIMER_CHANNEL_LEN);
 
     HAL_TIM_Base_Start_IT(&htim7);
-    set_torque(&torque1_value, 80.0f);
-    set_torque(&torque2_value, 0.0f);
-    control_wheels(torque1_value, torque2_value);
-    HAL_Delay(100);
     HAL_UART_Receive_IT(&huart2, &rx_buffer, 1);
+    enable_wheels();
 
   /* USER CODE END 2 */
 
@@ -345,65 +144,36 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-      if (dma_timer_channel_1_ready == 1) {
-          dma_timer_channel_1_ready = 0;
-          timestamp_channel_1 = HAL_GetTick();
-          filter_1_state.new_inp = calc_mean_diff(dma_buffer_timer_channel_1_safe, DMA_TIMER_CHANNEL_HALF_LEN + 1);
-          //filter_1_state.out = filter_butter(filter_1_state.new_inp, filter_1_state.filter_state);
-          iterate_moving_average_filter(&filter_1_state);
-          dma_buffer_timer_channel_1_safe[0] = dma_buffer_timer_channel_1_safe[DMA_TIMER_CHANNEL_HALF_LEN];
+      if ((dma_timer_channel_1_ready == 1) || (dma_timer_channel_2_ready == 1)) {
+          // update wheel_1_odometry and wheel_2_odometry
+          calc_wheel_speed();
       }
-      if (dma_timer_channel_2_ready == 1) {
-          dma_timer_channel_2_ready = 0;
-          timestamp_channel_2 = HAL_GetTick();
-          filter_2_state.new_inp = calc_mean_diff(dma_buffer_timer_channel_2_safe, DMA_TIMER_CHANNEL_HALF_LEN + 1);
-          //filter_2_state.out = filter_butter(filter_2_state.new_inp, filter_2_state.filter_state);
-          iterate_moving_average_filter(&filter_2_state);
-          dma_buffer_timer_channel_2_safe[0] = dma_buffer_timer_channel_2_safe[DMA_TIMER_CHANNEL_HALF_LEN];
-      }
+      validate_odometry();
 
-      timestamp = HAL_GetTick();
-      if ((timestamp - timestamp_channel_1)>= TIMEOUT_MS) {
-          filter_1_state.out = 0.0f;
-      }
-      if ((timestamp - timestamp_channel_2)>= TIMEOUT_MS) {
-          filter_2_state.out = 0.0f;
+      if (is_rx_timeout() == 1) {
+          stop();
       }
 
       if (timer100Hz_elapsed == 1) {
-          if (loop_cnt % 100 == 0) {
-              if (fabsf(filter_1_state.out - target_speed1) > 10.0f) {
-                  if (filter_1_state.out > target_speed1) {
-                      torq1 -= 1.0f;
-                  } else {
-                      torq1 += 1.0f;
-                  }
-              }
-          }
-          if (target_speed1 < MIN_SPEED) {
-              torq1 = 0.0f;
-          } else {
-              if (torq1 < UNIT_TORQUE) {
-                  torq1 = UNIT_TORQUE;
-              }
-          }
-          set_torque(&torque1_value, torq1);
-          set_torque(&torque2_value, 0.0f);
-          control_wheels(torque1_value, torque2_value);
+          control_iterate(0, wheel_1_odometry);
+          control_iterate(1, wheel_2_odometry);
+          // force wheels moving
+          force_wheels();
           timer100Hz_elapsed = 0;
       }
       if (rx_buffer_ready == 1) {
           rx_buffer_ready = 0;
           if (rx_command.is_request == 1) {
               sprintf((char *)tx_buffer, "%0.7f; %0.7f\r\n",
-                      filter_1_state.out,
-                      filter_2_state.out);
+                      wheel_1_odometry.speed,
+                      wheel_2_odometry.speed);
               try_send_data(tx_buffer, strlen((char *) tx_buffer));
+          } else if (rx_command.emergency_stop ==1) {
+              emergency_stop();
           } else {
-              target_speed1 = rx_command.speed1;
-              if (target_speed1 < MIN_SPEED) {
-                  target_speed1 = 0.0f;
-              }
+              enable_wheels();
+              set_target_speed(0, rx_command.speed1);
+              set_target_speed(1, rx_command.speed2);
           }
       }
   }
